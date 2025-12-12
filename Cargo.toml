@@ -23,7 +23,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85.1"
+rust-version = "1.85.0"
 repository = "https://github.com/zcash/librustzcash"
 license = "MIT OR Apache-2.0"
 categories = ["cryptography::cryptocurrencies"]
@@ -184,6 +184,17 @@ zip32 = { version = "0.2", default-features = false }
 
 # Workaround for https://anonticket.torproject.org/user/projects/arti/issues/pending/4028/
 time-core = "=0.1.2"
+
+[patch.crates-io]
+# Used in orchard
+radium = { path = "./patched-deps/radium" }
+# Used in bip32 in librustzcash
+secp256k1 = { path = "./patched-deps/rust-secp256k1" }
+# Used in librustzcash
+orchard = { path = "./patched-deps/orchard" }
+sapling-crypto = { path = "./patched-deps/sapling-crypto" }
+# Used by multiple deps
+spin = { path = "./patched-deps/spin" }
 
 [workspace.metadata.release]
 consolidate-commits = false
