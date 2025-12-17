@@ -5,7 +5,7 @@
 use blake2b_simd::{Hash, State};
 use core2::io::{self, Read, Write};
 
-pub(crate) trait ReadBytesExt {
+pub trait ReadBytesExt {
     fn read_u8(self) -> io::Result<u8>;
     fn read_u32_le(self) -> io::Result<u32>;
     fn read_i32_le(self) -> io::Result<i32>;
@@ -38,7 +38,7 @@ impl<R: Read> ReadBytesExt for &mut R {
     }
 }
 
-pub(crate) trait WriteBytesExt {
+pub trait WriteBytesExt {
     fn write_u8(self, value: u8) -> io::Result<()>;
     fn write_u32_le(self, value: u32) -> io::Result<()>;
     fn write_i32_le(self, value: i32) -> io::Result<()>;
