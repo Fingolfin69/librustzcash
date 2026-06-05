@@ -3,7 +3,6 @@
 use incrementalmerkletree::Position;
 use rusqlite::{Connection, Row, named_params, types::Value};
 use std::{num::NonZeroU64, rc::Rc};
-use zip32::Scope;
 
 use zcash_client_backend::{
     data_api::{
@@ -352,7 +351,7 @@ where
 /// - Notes with individual value *below* the ``MARGINAL_FEE`` will be ignored
 /// - Note spendability is determined using the `target_height`. If the note is mined at a height
 ///   greater than or equal to the target height, it will still be returned by this query.
-/// - The `to_spendable_note` function is expected to return `Ok(None)` in the case that spending
+/// - The `to_received_note` function is expected to return `Ok(None)` in the case that spending
 ///   key details cannot be determined.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select_unspent_notes<P: consensus::Parameters, F, Note>(
@@ -384,6 +383,7 @@ where
              accounts.ufvk as ufvk, rn.recipient_key_scope,
              t.block AS mined_height,
              scan_state.max_priority,
+             rn.witness_stabilized,
              IFNULL(t.trust_status, 0) AS trust_status,
              MAX(tt.mined_height) AS max_shielding_input_height,
              MIN(IFNULL(tt.trust_status, 0)) AS min_shielding_input_trust
@@ -435,6 +435,7 @@ where
         |row| -> Result<_, SqliteClientError> {
             let result_note = to_received_note(params, row)?;
             let max_priority_raw = row.get::<_, Option<i64>>("max_priority")?;
+            let witness_stabilized = row.get::<_, bool>("witness_stabilized")?;
             let tx_trust_status = row.get::<_, bool>("trust_status")?;
             let tx_shielding_inputs_trusted = row.get::<_, bool>("min_shielding_input_trust")?;
             let shard_scan_priority = max_priority_raw
@@ -449,6 +450,7 @@ where
 
             Ok((
                 result_note,
+                witness_stabilized,
                 shard_scan_priority,
                 tx_trust_status,
                 tx_shielding_inputs_trusted,
@@ -456,47 +458,37 @@ where
         },
     )?;
 
-    let trusted_height = target_height.saturating_sub(u32::from(confirmations_policy.trusted()));
-    let untrusted_height =
-        target_height.saturating_sub(u32::from(confirmations_policy.untrusted()));
-
     row_results
         .map(|t| match t? {
-            (Some(note), max_shard_priority, trusted, tx_shielding_inputs_trusted) => {
-                let shard_scanned = max_shard_priority
-                    .iter()
-                    .any(|p| *p <= ScanPriority::Scanned);
+            (
+                Some(note),
+                witness_stabilized,
+                max_shard_priority,
+                tx_trusted,
+                tx_shielding_inputs_trusted,
+            ) => {
+                let shard_witness_available = witness_stabilized
+                    || max_shard_priority.is_some_and(|p| p <= ScanPriority::Scanned);
 
                 let mined_at_anchor = note
                     .mined_height()
                     .zip(note_request.anchor_height())
                     .is_some_and(|(h, ah)| h <= ah);
 
-                let has_confirmations = match (note.mined_height(), note.spending_key_scope()) {
-                    (None, _) => false,
-                    (Some(received_height), Scope::Internal) => {
-                        // The note has the required number of confirmations for a trusted note.
-                        received_height <= trusted_height &&
-                        // if the note was the output of a shielding transaction
-                        note.max_shielding_input_height().iter().all(|h| {
-                            // its inputs have at least `untrusted` confirmations
-                            h <= &untrusted_height ||
-                            // or its inputs are trusted and have at least `trusted` confirmations
-                            (h <= &trusted_height && tx_shielding_inputs_trusted)
-                        })
-                    }
-                    (Some(received_height), Scope::External) => {
-                        // The note has the required number of confirmations for an untrusted note.
-                        received_height <= untrusted_height ||
-                        // or it is the output of an explicitly trusted tx and has at least
-                        // `trusted` confirmations
-                        (received_height <= trusted_height && trusted)
-                    }
-                };
+                let has_confirmations = witness_stabilized
+                    || confirmations_policy.confirmations_until_spendable(
+                        target_height,
+                        PoolType::Shielded(protocol),
+                        Some(note.spending_key_scope()),
+                        note.mined_height(),
+                        tx_trusted,
+                        note.max_shielding_input_height(),
+                        tx_shielding_inputs_trusted,
+                    ) == 0;
 
                 match (
                     note_request,
-                    shard_scanned && mined_at_anchor && has_confirmations,
+                    shard_witness_available && mined_at_anchor && has_confirmations,
                 ) {
                     (NoteRequest::UnspentOrError { .. }, false) => {
                         Err(SqliteClientError::IneligibleNotes)
@@ -540,9 +532,10 @@ where
         note_reconstruction_cols,
         ..
     } = table_constants::<SqliteClientError>(protocol)?;
-    if unscanned_tip_exists(conn, anchor_height, table_prefix)? {
-        return Ok(vec![]);
-    }
+
+    // When an anchor exists within an unscanned range, nodes without stabilized witness data will
+    // not be reliably constructable. The selection query will use this to filter out such notes.
+    let tip_unscanned = unscanned_tip_exists(conn, anchor_height, table_prefix)?;
 
     // The goal of this SQL statement is to select the oldest notes until the required
     // value has been reached.
@@ -567,6 +560,7 @@ where
                  SUM(value) OVER (ROWS UNBOUNDED PRECEDING) AS so_far,
                  accounts.ufvk as ufvk, rn.recipient_key_scope,
                  t.block AS mined_height,
+                 rn.witness_stabilized,
                  IFNULL(t.trust_status, 0) AS trust_status,
                  MAX(tt.mined_height) AS max_shielding_input_height,
                  MIN(IFNULL(tt.trust_status, 0)) AS min_shielding_input_trust
@@ -588,11 +582,18 @@ where
              AND accounts.ufvk IS NOT NULL
              AND recipient_key_scope IS NOT NULL
              AND nf IS NOT NULL
-             -- the shard containing the note is fully scanned; this condition will exclude
-             -- notes for which `scan_state.max_priority IS NULL` (which will also arise if
-             -- `rn.commitment_tree_position IS NULL`; hence we don't need that explicit filter)
-             AND scan_state.max_priority <= :scanned_priority
+             -- The note must be mined at or below the anchor for the anchor's tree
+             -- frontier to witness it
              AND t.block <= :anchor_height
+             -- A stabilized note's witness is durable across rewinds, so it bypasses
+             -- the scan-state gating
+             AND (
+                 rn.witness_stabilized = 1
+                 OR (
+                     :tip_unscanned = 0 -- the tip shard has no unscanned ranges
+                     AND scan_state.max_priority <= :scanned_priority -- the note shard is fully scanned or ignored
+                 )
+             )
              AND rn.id NOT IN rarray(:exclude)
              AND rn.id NOT IN ({})
              GROUP BY rn.id
@@ -600,14 +601,14 @@ where
          SELECT id, txid, {output_index_col},
                 diversifier, value, {note_reconstruction_cols}, commitment_tree_position,
                 ufvk, recipient_key_scope,
-                mined_height, trust_status,
+                mined_height, witness_stabilized, trust_status,
                 max_shielding_input_height, min_shielding_input_trust
          FROM eligible WHERE so_far < :target_value
          UNION
          SELECT id, txid, {output_index_col},
                 diversifier, value, {note_reconstruction_cols}, commitment_tree_position,
                 ufvk, recipient_key_scope,
-                mined_height, trust_status,
+                mined_height, witness_stabilized, trust_status,
                 max_shielding_input_height, min_shielding_input_trust
          FROM (SELECT * from eligible WHERE so_far >= :target_value LIMIT 1)",
         spent_notes_clause(table_prefix)
@@ -633,54 +634,59 @@ where
             ":target_value": &u64::from(target_value),
             ":exclude": &excluded_ptr,
             ":scanned_priority": priority_code(&ScanPriority::Scanned),
+            ":tip_unscanned": i64::from(tip_unscanned),
             ":min_value": u64::from(zip317::MARGINAL_FEE)
         ],
         |row| {
             let tx_trust_status = row.get::<_, bool>("trust_status")?;
+            let max_shielding_input_height = row
+                .get::<_, Option<u32>>("max_shielding_input_height")?
+                .map(BlockHeight::from);
             let tx_shielding_inputs_trusted = row.get::<_, bool>("min_shielding_input_trust")?;
+            let witness_stabilized = row.get::<_, bool>("witness_stabilized")?;
             let note = to_spendable_note(params, row)?;
 
-            Ok(note.map(|n| (n, tx_trust_status, tx_shielding_inputs_trusted)))
+            Ok(note.map(|n| {
+                (
+                    n,
+                    tx_trust_status,
+                    max_shielding_input_height,
+                    tx_shielding_inputs_trusted,
+                    witness_stabilized,
+                )
+            }))
         },
     )?;
-
-    let trusted_height = target_height.saturating_sub(u32::from(confirmations_policy.trusted()));
-    let untrusted_height =
-        target_height.saturating_sub(u32::from(confirmations_policy.untrusted()));
 
     notes
         .filter_map(|result_maybe_note| {
             let result_note = result_maybe_note.transpose()?;
             result_note
-                .map(|(note, trusted, tx_shielding_inputs_trusted)| {
-                    let received_height = note
-                        .mined_height()
-                        .expect("mined height checked to be non-null");
+                .map(
+                    |(
+                        note,
+                        tx_trusted,
+                        max_shielding_input_height,
+                        tx_shielding_inputs_trusted,
+                        witness_stabilized,
+                    )| {
+                        // A stabilized note was confirmed well beyond any reasonable
+                        // confirmations policy at stabilization time, so the confirmations
+                        // check is trivially satisfied.
+                        let has_confirmations = witness_stabilized
+                            || confirmations_policy.confirmations_until_spendable(
+                                target_height,
+                                PoolType::Shielded(protocol),
+                                Some(note.spending_key_scope()),
+                                note.mined_height(),
+                                tx_trusted,
+                                max_shielding_input_height,
+                                tx_shielding_inputs_trusted,
+                            ) == 0;
 
-                    let has_confirmations = match note.spending_key_scope() {
-                        Scope::Internal => {
-                            // The note was has at least `trusted` confirmations.
-                            received_height <= trusted_height &&
-                            // And, if the note was the output of a shielding transaction, its
-                            // transparent inputs have at least `untrusted` confirmations.
-                            note.max_shielding_input_height().iter().all(|h| {
-                                // its inputs have at least `untrusted` confirmations
-                                h <= &untrusted_height ||
-                                // or its inputs are trusted and have at least `trusted` confirmations
-                                (h <= &trusted_height && tx_shielding_inputs_trusted)
-                            })
-                        }
-                        Scope::External => {
-                            // The note has the required number of confirmations for an untrusted note.
-                            received_height <= untrusted_height ||
-                            // or it is the output of an explicitly trusted tx and has at least
-                            // `trusted` confirmations
-                            (received_height <= trusted_height && trusted)
-                        }
-                    };
-
-                    has_confirmations.then_some(note)
-                })
+                        has_confirmations.then_some(note)
+                    },
+                )
                 .transpose()
         })
         .collect::<Result<Vec<_>, _>>()
@@ -735,7 +741,7 @@ pub(crate) fn select_unspent_note_meta(
     //
     // TODO: Deduplicate this in the future by introducing a view?
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {table_prefix}_received_notes.id AS id, txid, {output_index_col},
+        "SELECT rn.id AS id, txid, {output_index_col},
                 commitment_tree_position, value
          FROM {table_prefix}_received_notes rn
          INNER JOIN transactions ON transactions.id_tx = rn.transaction_id
@@ -817,7 +823,7 @@ pub(crate) fn unspent_notes_meta(
                  INNER JOIN transactions ON transactions.id_tx = rn.transaction_id
                  WHERE a.uuid = :account_uuid
                  AND a.ufvk IS NOT NULL
-                 AND rn.value >= :min_value
+                 AND rn.value > :min_value
                  AND transactions.mined_height IS NOT NULL
                  AND rn.id NOT IN rarray(:exclude)
                  AND rn.id NOT IN ({})",
@@ -956,5 +962,44 @@ pub(crate) fn unspent_notes_meta(
         )))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zcash_client_backend::data_api::testing::{
+        AddressType, TestBuilder, pool::ShieldedPoolTester, sapling::SaplingPoolTester,
+    };
+    use zcash_primitives::block::BlockHash;
+    use zcash_protocol::{ShieldedProtocol, value::Zatoshis};
+
+    use crate::testing::{BlockCache, db::TestDbFactory};
+
+    #[test]
+    fn select_unspent_note_meta() {
+        let cache = BlockCache::new();
+        let mut st = TestBuilder::new()
+            .with_block_cache(cache)
+            .with_data_store_factory(TestDbFactory::default())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+
+        let birthday_height = st.test_account().unwrap().birthday().height();
+        let dfvk = SaplingPoolTester::test_account_fvk(&st);
+
+        // Add funds to the wallet in a single note
+        let value = Zatoshis::const_from_u64(60000);
+        let (h, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
+        st.scan_cached_blocks(h, 1);
+
+        let unspent_note_meta = super::select_unspent_note_meta(
+            st.wallet().conn(),
+            ShieldedProtocol::Sapling,
+            birthday_height,
+            h,
+        )
+        .unwrap();
+
+        assert_eq!(unspent_note_meta.len(), 1);
     }
 }

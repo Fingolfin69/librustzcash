@@ -120,7 +120,7 @@ pub fn decrypt_transaction<'a, P: consensus::Parameters, AccountId: Copy>(
     chain_tip_height: Option<BlockHeight>,
     tx: &'a Transaction,
     ufvks: &HashMap<AccountId, UnifiedFullViewingKey>,
-) -> DecryptedTransaction<'a, AccountId> {
+) -> DecryptedTransaction<'a, Transaction, AccountId> {
     let zip212_enforcement = zip212_enforcement(
         params,
         // Height is block height for mined transactions, and the "mempool height" (chain height + 1)
@@ -130,7 +130,8 @@ pub fn decrypt_transaction<'a, P: consensus::Parameters, AccountId: Copy>(
             chain_tip_height
                 .map(|max_height| max_height + 1) // "mempool height"
                 .or_else(|| params.activation_height(NetworkUpgrade::Sapling))
-                .expect("Sapling activation height must be known.")
+                // Fall back to the genesis block in regtest mode.
+                .unwrap_or_else(|| BlockHeight::from(0))
         }),
     );
     let sapling_bundle = tx.sapling_bundle();

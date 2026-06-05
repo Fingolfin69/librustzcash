@@ -23,9 +23,12 @@ use shardtree::store::ShardStore;
 use crate::{Account, AccountId, Error, MemBlockCache, MemoryWalletDb, SentNoteId};
 
 #[cfg(feature = "transparent-inputs")]
-use zcash_client_backend::{
-    data_api::{InputSource, WalletRead, testing::transparent::GapLimits, wallet::TargetHeight},
-    wallet::WalletTransparentOutput,
+use {
+    zcash_client_backend::{
+        data_api::{InputSource, WalletRead, wallet::TargetHeight},
+        wallet::WalletTransparentOutput,
+    },
+    zcash_keys::keys::transparent::gap_limits::GapLimits,
 };
 
 pub mod pool;
@@ -201,8 +204,8 @@ where
     ) -> Result<Vec<NoteId>, Error> {
         Ok(self
             .get_sent_notes()
-            .iter()
-            .filter_map(|(id, _)| {
+            .keys()
+            .filter_map(|id| {
                 if let SentNoteId::Shielded(id) = id {
                     if id.txid() == txid && id.protocol() == protocol {
                         Some(*id)
@@ -388,7 +391,7 @@ where
             _ => {}
         }
 
-        checkpoints.sort_by(|(a, _), (b, _)| a.cmp(b));
+        checkpoints.sort_by_key(|(a, _)| *a);
 
         Ok(checkpoints)
     }
